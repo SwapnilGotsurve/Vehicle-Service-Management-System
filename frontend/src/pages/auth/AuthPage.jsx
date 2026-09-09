@@ -1,0 +1,12 @@
+import { useState } from 'react';
+import { ChevronRight } from 'lucide-react';
+import { post } from '../../api';
+
+export default function AuthPage({ onAuth }) {
+  const [mode, setMode] = useState('login');
+  const [form, setForm] = useState({ name: '', email: '', password: '' });
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  async function submit(event) { event.preventDefault(); setBusy(true); setError(''); try { const data = await post(`/auth/${mode}`, form); localStorage.setItem('vsms_token', data.token); onAuth(data.user); } catch (err) { setError(err.message); } finally { setBusy(false); } }
+  return <main className="auth-shell"><section className="auth-visual"><div className="brand-mark">F<span>/</span></div><p className="eyebrow">Forge service desk</p><h1>Keep every vehicle moving.</h1><p className="muted">A calmer, clearer command center for modern service teams.</p><div className="visual-stat"><strong>24/7</strong><span>service visibility</span></div></section><section className="auth-card"><div className="mobile-brand"><div className="brand-mark">F<span>/</span></div><b>Forge</b></div><p className="eyebrow">{mode === 'login' ? 'Welcome back' : 'Create your account'}</p><h2>{mode === 'login' ? 'Sign in to your desk' : 'Start your service journey'}</h2><p className="muted">{mode === 'login' ? 'Access bookings, vehicles, and live progress.' : 'Register to manage your vehicles and book service.'}</p><form onSubmit={submit}>{mode === 'register' && <label>Full name<input required value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Your name" /></label>}<label>Email<input required type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} placeholder="you@example.com" /></label><label>Password<input required minLength="8" type="password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} placeholder="8+ characters" /></label>{error && <p className="error">{error}</p>}<button className="primary full" disabled={busy}>{busy ? 'Please wait...' : mode === 'login' ? 'Sign in' : 'Create account'} <ChevronRight size={17} /></button></form><button className="text-button" onClick={() => { setMode(mode === 'login' ? 'register' : 'login'); setError(''); }}>{mode === 'login' ? 'New here? Create an account' : 'Already registered? Sign in'}</button></section></main>;
+}
