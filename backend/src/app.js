@@ -600,18 +600,74 @@ app.get('/api/dashboard/:role', protect, asyncRoute(async (req, res) => {
   const customerScope = req.user.role === 'customer' ? { customer: req.user._id } : {};
   const mechanicScope = req.user.role === 'mechanic' ? { assignedMechanic: req.user._id } : {};
   const bookingScope = { ...customerScope, ...mechanicScope };
-  const [vehicles, bookings, activeServices, mechanics, pending, confirmed, active, completed, todayBookings, completedToday, customers, invoices, lowStock, statusBreakdown, recentBookings] = await Promise.all([
+  const srScope = req.user.role === 'customer' ? { customer: req.user._id } : req.user.role === 'mechanic' ? { mechanic: req.user._id } : {};
+
+  const srPopulateFields = [
+    { path: 'vehicle', select: 'brand model registrationNumber year color' },
+    { path: 'customer', select: 'name email phone' },
+    { path: 'mechanic', select: 'name specialization phone' },
+    { path: 'booking', populate: { path: 'service', select: 'name price category' } },
+  ];
+
+  const [
+    vehicles, bookings, activeServices, mechanics,
+    pending, confirmed, active, completed,
+    todayBookings, completedToday, customers,
+    invoices, lowStock, statusBreakdown, recentBookings,
+    recentServiceRecords, invoiceHistory,
+  ] = await Promise.all([
     Vehicle.countDocuments(req.user.role === 'customer' ? { owner: req.user._id, isActive: true } : {}),
-    Booking.countDocuments(bookingScope), Service.countDocuments({ status: 'Active' }), User.countDocuments({ role: 'mechanic', isActive: true }),
-    Booking.countDocuments({ ...bookingScope, status: 'Pending' }), Booking.countDocuments({ ...bookingScope, status: 'Confirmed' }), Booking.countDocuments({ ...bookingScope, status: { $in: ['Assigned', 'Inspection', 'In Progress', 'Waiting for Parts'] } }), Booking.countDocuments({ ...bookingScope, status: 'Completed' }),
-    Booking.countDocuments({ ...bookingScope, bookingDate: { $gte: today, $lt: tomorrow }, status: { $nin: ['Cancelled', 'Rejected'] } }), Booking.countDocuments({ status: 'Completed', updatedAt: { $gte: today, $lt: tomorrow } }),
+    Booking.countDocuments(bookingScope),
+    Service.countDocuments({ status: 'Active' }),
+    User.countDocuments({ role: 'mechanic', isActive: true }),
+    Booking.countDocuments({ ...bookingScope, status: 'Pending' }),
+    Booking.countDocuments({ ...bookingScope, status: 'Confirmed' }),
+    Booking.countDocuments({ ...bookingScope, status: { $in: ['Assigned', 'Inspection', 'In Progress', 'Waiting for Parts'] } }),
+    Booking.countDocuments({ ...bookingScope, status: 'Completed' }),
+    Booking.countDocuments({ ...bookingScope, bookingDate: { $gte: today, $lt: tomorrow }, status: { $nin: ['Cancelled', 'Rejected'] } }),
+    Booking.countDocuments({ status: 'Completed', updatedAt: { $gte: today, $lt: tomorrow } }),
     User.countDocuments({ role: 'customer', isActive: true }),
-    Invoice.aggregate([{ $match: req.user.role === 'customer' ? { customer: req.user._id } : {} }, { $group: { _id: null, revenue: { $sum: '$grandTotal' }, pending: { $sum: { $cond: [{ $eq: ['$paymentStatus', 'Pending'] }, 1, 0] } } } }]),
-    Part.countDocuments({ $expr: { $lte: ['$quantity', '$minimumStock'] } }), Booking.aggregate([{ $match: bookingScope }, { $group: { _id: '$status', count: { $sum: 1 } } }, { $sort: { count: -1 } }]),
-    Booking.find(bookingScope).populate('customer', 'name').populate('vehicle', 'registrationNumber brand model').populate('service', 'name price').populate('assignedMechanic', 'name').sort({ bookingDate: 1 }).limit(6)
+    Invoice.aggregate([
+      { $match: req.user.role === 'customer' ? { customer: req.user._id } : {} },
+      { $group: { _id: null, revenue: { $sum: '$grandTotal' }, pending: { $sum: { $cond: [{ $eq: ['$paymentStatus', 'Pending'] }, 1, 0] } }, paid: { $sum: { $cond: [{ $eq: ['$paymentStatus', 'Paid'] }, '$grandTotal', 0] } } } },
+    ]),
+    Part.countDocuments({ $expr: { $lte: ['$quantity', '$minimumStock'] } }),
+    Booking.aggregate([{ $match: bookingScope }, { $group: { _id: '$status', count: { $sum: 1 } } }, { $sort: { count: -1 } }]),
+    Booking.find(bookingScope)
+      .populate('customer', 'name')
+      .populate('vehicle', 'registrationNumber brand model')
+      .populate('service', 'name price')
+      .populate('assignedMechanic', 'name specialization')
+      .sort({ bookingDate: 1 }).limit(6),
+    // Service records with full detail for history section
+    ServiceRecord.find(srScope)
+      .populate(srPopulateFields)
+      .sort('-createdAt')
+      .limit(8),
+    // Invoice history per customer or all for admin/staff
+    req.user.role === 'customer'
+      ? Invoice.find({ customer: req.user._id }).populate('booking', 'bookingDate').populate('vehicle', 'brand model registrationNumber').sort('-createdAt').limit(5)
+      : Invoice.find({ paymentStatus: 'Pending' }).populate('customer', 'name').populate('vehicle', 'brand model registrationNumber').sort('-createdAt').limit(6),
   ]);
-  const dashboard = { role: req.user.role, vehicles, bookings, activeServices, mechanics, pending, confirmed, active, completed, todayBookings, completedToday, customers, revenue: invoices[0]?.revenue || 0, pendingPayments: invoices[0]?.pending || 0, lowStock, statusBreakdown, recentBookings };
-  dashboard.headline = { customer: 'Your service overview', admin: 'The whole service center, at a glance', staff: "Today's service desk", mechanic: 'Your assigned workshop' }[req.user.role];
+
+  const dashboard = {
+    role: req.user.role,
+    vehicles, bookings, activeServices, mechanics,
+    pending, confirmed, active, completed,
+    todayBookings, completedToday, customers,
+    revenue: invoices[0]?.revenue || 0,
+    revenueCollected: invoices[0]?.paid || 0,
+    pendingPayments: invoices[0]?.pending || 0,
+    lowStock, statusBreakdown, recentBookings,
+    recentServiceRecords,
+    invoiceHistory,
+  };
+  dashboard.headline = {
+    customer: 'Your service overview',
+    admin:    'The whole service center, at a glance',
+    staff:    "Today's service desk",
+    mechanic: 'Your assigned workshop',
+  }[req.user.role];
   ok(res, dashboard);
 }));
 
