@@ -27,6 +27,33 @@ app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, max: 100 }));
 const ok = (res, data, message = '') => res.json({ success: true, message, data });
 const tokenFor = (id) => jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '7d' });
 const asyncRoute = (handler) => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
+const invoicePopulate = [
+  { path: 'customer', select: 'name email phone address' },
+  { path: 'vehicle' },
+  { path: 'createdBy', select: 'name role' },
+  { path: 'booking', populate: [{ path: 'service', select: 'name price category' }, { path: 'customer', select: 'name email' }] },
+];
+function invoiceTotals(rawItems, discount, tax) {
+  const items = (rawItems || []).map((item) => {
+    const quantity = Math.max(1, Number(item.quantity) || 1);
+    const price = Math.max(0, Number(item.price) || 0);
+    return { type: ['service', 'part', 'labor', 'other'].includes(item.type) ? item.type : 'service', name: String(item.name || '').trim(), quantity, price, total: Number((quantity * price).toFixed(2)) };
+  }).filter((item) => item.name);
+  const subtotal = Number(items.reduce((sum, item) => sum + item.total, 0).toFixed(2));
+  const safeDiscount = Math.max(0, Number(discount) || 0);
+  const safeTax = Math.max(0, Number(tax) || 0);
+  return { items, subtotal, discount: safeDiscount, tax: safeTax, grandTotal: Number(Math.max(0, subtotal - safeDiscount + safeTax).toFixed(2)) };
+}
+function canViewInvoice(user, invoice) {
+  if (!invoice) return false;
+  if (user.role === 'customer') return String(invoice.customer?._id || invoice.customer) === String(user._id);
+  return ['admin', 'staff'].includes(user.role);
+}
+async function nextInvoiceNumber() {
+  const year = new Date().getFullYear();
+  const count = await Invoice.countDocuments({ invoiceNumber: new RegExp(`^INV-${year}-`) });
+  return `INV-${year}-${String(count + 1).padStart(5, '0')}`;
+}
 
 app.get('/api/health', (req, res) => ok(res, { service: 'VSMS API', status: 'operational' }));
 app.post('/api/auth/register', asyncRoute(async (req, res) => {
@@ -129,19 +156,164 @@ app.post('/api/users', protect, allow('admin', 'staff'), asyncRoute(async (req, 
   if (!name || !email || !password) return res.status(422).json({ success: false, message: 'Name, email, and password are required' });
   if (password.length < 8) return res.status(422).json({ success: false, message: 'Password must be at least 8 characters' });
   if (!/[A-Z]/.test(password) || !/[a-z]/.test(password) || !/[0-9]/.test(password)) return res.status(422).json({ success: false, message: 'Password needs uppercase, lowercase and a number' });
+  if (role === 'admin' && req.user.role !== 'admin') return res.status(403).json({ success: false, message: 'Only admins can create admin accounts' });
   if (await User.findOne({ email })) return res.status(409).json({ success: false, message: 'Email is already registered' });
   ok(res, await User.create({ name, email, password, role, specialization }), 'Team member created');
 }));
-app.patch('/api/users/:id/status', protect, allow('admin'), asyncRoute(async (req, res) => ok(res, await User.findByIdAndUpdate(req.params.id, { isActive: req.body.isActive }, { new: true }).select('name email role isActive'), 'Team member status updated')));
+app.patch('/api/users/:id/status', protect, allow('admin', 'staff'), asyncRoute(async (req, res) => {
+  const user = await User.findById(req.params.id);
+  if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+  if (user.role === 'admin' && req.user.role !== 'admin') return res.status(403).json({ success: false, message: 'Only admins can manage admin accounts' });
+  ok(res, await User.findByIdAndUpdate(req.params.id, { isActive: req.body.isActive }, { new: true }).select('name email role isActive'), 'Team member status updated');
+}));
 app.get('/api/parts', protect, allow('admin', 'staff', 'mechanic'), asyncRoute(async (req, res) => ok(res, await Part.find().sort('name'))));
 app.post('/api/parts', protect, allow('admin', 'staff'), asyncRoute(async (req, res) => ok(res, await Part.create(req.body), 'Part added')));
 app.put('/api/parts/:id', protect, allow('admin', 'staff'), asyncRoute(async (req, res) => ok(res, await Part.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true }), 'Part updated')));
 app.patch('/api/parts/:id/stock', protect, allow('admin', 'staff', 'mechanic'), asyncRoute(async (req, res) => { const amount = Number(req.body.amount); if (!Number.isFinite(amount) || amount === 0) return res.status(422).json({ success: false, message: 'Stock amount must be a non-zero number' }); const part = await Part.findOneAndUpdate({ _id: req.params.id, ...(amount < 0 ? { quantity: { $gte: Math.abs(amount) } } : {}) }, { $inc: { quantity: amount } }, { new: true }); if (!part) return res.status(409).json({ success: false, message: 'Insufficient stock or part not found' }); ok(res, part, 'Stock updated'); }));
 app.get('/api/service-records', protect, asyncRoute(async (req, res) => ok(res, await ServiceRecord.find(req.user.role === 'customer' ? { customer: req.user._id } : req.user.role === 'mechanic' ? { mechanic: req.user._id } : {}).populate('vehicle booking mechanic').sort('-completedAt'))));
 app.post('/api/service-records', protect, allow('admin', 'staff', 'mechanic'), asyncRoute(async (req, res) => { const record = await ServiceRecord.create({ ...req.body, mechanic: req.user.role === 'mechanic' ? req.user._id : req.body.mechanic }); await Booking.findByIdAndUpdate(req.body.booking, { status: 'Completed' }); ok(res, record, 'Service record created'); }));
-app.get('/api/invoices', protect, asyncRoute(async (req, res) => ok(res, await Invoice.find(req.user.role === 'customer' ? { customer: req.user._id } : {}).populate('vehicle booking').sort('-createdAt'))));
-app.post('/api/invoices', protect, allow('admin', 'staff'), asyncRoute(async (req, res) => { const booking = await Booking.findById(req.body.booking).populate('customer vehicle service'); if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' }); const items = (req.body.items || []).map((item) => ({ ...item, total: Number(item.quantity) * Number(item.price) })); const subtotal = items.reduce((sum, item) => sum + item.total, 0); const discount = Math.max(0, Number(req.body.discount) || 0); const tax = Math.max(0, Number(req.body.tax) || 0); const grandTotal = Math.max(0, subtotal - discount + tax); const invoiceNumber = `INV-${new Date().getFullYear()}-${String(await Invoice.countDocuments() + 1).padStart(5, '0')}`; ok(res, await Invoice.create({ invoiceNumber, booking: booking._id, customer: booking.customer._id, vehicle: booking.vehicle._id, items, subtotal, discount, tax, grandTotal }), 'Invoice generated'); }));
-app.patch('/api/invoices/:id/payment', protect, allow('admin', 'staff'), asyncRoute(async (req, res) => ok(res, await Invoice.findByIdAndUpdate(req.params.id, { paymentStatus: req.body.paymentStatus, paymentMethod: req.body.paymentMethod }, { new: true }), 'Payment updated')));
+app.get('/api/invoices', protect, asyncRoute(async (req, res) => {
+  if (!['customer', 'admin', 'staff'].includes(req.user.role)) return res.status(403).json({ success: false, message: 'You do not have access to invoices' });
+  const filter = req.user.role === 'customer' ? { customer: req.user._id } : {};
+  ok(res, await Invoice.find(filter).populate(invoicePopulate).sort('-createdAt'));
+}));
+app.get('/api/invoices/:id', protect, asyncRoute(async (req, res) => {
+  const invoice = await Invoice.findById(req.params.id).populate(invoicePopulate);
+  if (!invoice || !canViewInvoice(req.user, invoice)) return res.status(404).json({ success: false, message: 'Invoice not found' });
+  ok(res, invoice);
+}));
+app.post('/api/invoices', protect, allow('admin', 'staff'), asyncRoute(async (req, res) => {
+  const booking = await Booking.findById(req.body.booking).populate('customer vehicle service');
+  if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' });
+  if (['Cancelled', 'Rejected'].includes(booking.status)) return res.status(422).json({ success: false, message: 'Cannot invoice a cancelled or rejected booking' });
+  if (await Invoice.findOne({ booking: booking._id })) return res.status(409).json({ success: false, message: 'An invoice already exists for this booking' });
+  const seededItems = req.body.items?.length ? req.body.items : booking.service ? [{ type: 'service', name: booking.service.name, quantity: 1, price: booking.service.price }] : [];
+  const totals = invoiceTotals(seededItems, req.body.discount, req.body.tax);
+  if (!totals.items.length) return res.status(422).json({ success: false, message: 'Add at least one service or line item' });
+  const invoice = await Invoice.create({
+    invoiceNumber: await nextInvoiceNumber(),
+    booking: booking._id,
+    customer: booking.customer._id,
+    vehicle: booking.vehicle._id,
+    ...totals,
+    notes: req.body.notes || '',
+    paymentStatus: req.body.paymentStatus || 'Pending',
+    paymentMethod: req.body.paymentMethod || '',
+    createdBy: req.user._id,
+  });
+  await Notification.create({ user: booking.customer._id, title: 'Invoice ready', message: `Invoice ${invoice.invoiceNumber} for ₹${totals.grandTotal.toLocaleString('en-IN')} is ready to view and download.`, type: 'invoice' });
+  ok(res, await Invoice.findById(invoice._id).populate(invoicePopulate), 'Invoice generated');
+}));
+app.put('/api/invoices/:id', protect, allow('admin', 'staff'), asyncRoute(async (req, res) => {
+  const invoice = await Invoice.findById(req.params.id);
+  if (!invoice) return res.status(404).json({ success: false, message: 'Invoice not found' });
+  const totals = invoiceTotals(req.body.items, req.body.discount, req.body.tax);
+  if (!totals.items.length) return res.status(422).json({ success: false, message: 'Add at least one service or line item' });
+  invoice.set({
+    ...totals,
+    notes: req.body.notes ?? invoice.notes,
+    paymentStatus: req.body.paymentStatus || invoice.paymentStatus,
+    paymentMethod: req.body.paymentMethod ?? invoice.paymentMethod,
+  });
+  await invoice.save();
+  ok(res, await Invoice.findById(invoice._id).populate(invoicePopulate), 'Invoice updated');
+}));
+app.delete('/api/invoices/:id', protect, allow('admin', 'staff'), asyncRoute(async (req, res) => {
+  const invoice = await Invoice.findById(req.params.id);
+  if (!invoice) return res.status(404).json({ success: false, message: 'Invoice not found' });
+  if (invoice.paymentStatus === 'Paid' && req.user.role !== 'admin') return res.status(422).json({ success: false, message: 'Paid invoices can only be removed by an admin' });
+  await Payment.deleteMany({ invoice: invoice._id });
+  await invoice.deleteOne();
+  ok(res, null, 'Invoice deleted');
+}));
+app.patch('/api/invoices/:id/payment', protect, allow('admin', 'staff'), asyncRoute(async (req, res) => {
+  const invoice = await Invoice.findByIdAndUpdate(req.params.id, { paymentStatus: req.body.paymentStatus, paymentMethod: req.body.paymentMethod }, { new: true }).populate(invoicePopulate);
+  if (!invoice) return res.status(404).json({ success: false, message: 'Invoice not found' });
+  ok(res, invoice, 'Payment updated');
+}));
+
+// Admin invoice analytics — overall profit breakdown, monthly trend, top services
+app.get('/api/invoices/analytics/summary', protect, allow('admin'), asyncRoute(async (req, res) => {
+  const now = new Date();
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+  const startOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+  const endOfLastMonth = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59, 999);
+  const startOfYear = new Date(now.getFullYear(), 0, 1);
+
+  const [overall, thisMonth, lastMonth, thisYear, byPaymentMethod, byStatus, monthlyTrend, recentByCreator] = await Promise.all([
+    // Overall totals
+    Invoice.aggregate([
+      { $group: {
+        _id: null,
+        totalRevenue: { $sum: '$grandTotal' },
+        totalPaid: { $sum: { $cond: [{ $eq: ['$paymentStatus', 'Paid'] }, '$grandTotal', 0] } },
+        totalPending: { $sum: { $cond: [{ $eq: ['$paymentStatus', 'Pending'] }, '$grandTotal', 0] } },
+        totalPartial: { $sum: { $cond: [{ $eq: ['$paymentStatus', 'Partially Paid'] }, '$grandTotal', 0] } },
+        totalDiscount: { $sum: '$discount' },
+        totalTax: { $sum: '$tax' },
+        count: { $sum: 1 },
+        paidCount: { $sum: { $cond: [{ $eq: ['$paymentStatus', 'Paid'] }, 1, 0] } },
+        pendingCount: { $sum: { $cond: [{ $eq: ['$paymentStatus', 'Pending'] }, 1, 0] } },
+      }}
+    ]),
+    // This month
+    Invoice.aggregate([
+      { $match: { createdAt: { $gte: startOfMonth } } },
+      { $group: { _id: null, revenue: { $sum: '$grandTotal' }, count: { $sum: 1 }, paid: { $sum: { $cond: [{ $eq: ['$paymentStatus', 'Paid'] }, '$grandTotal', 0] } } } }
+    ]),
+    // Last month
+    Invoice.aggregate([
+      { $match: { createdAt: { $gte: startOfLastMonth, $lte: endOfLastMonth } } },
+      { $group: { _id: null, revenue: { $sum: '$grandTotal' }, count: { $sum: 1 } } }
+    ]),
+    // This year
+    Invoice.aggregate([
+      { $match: { createdAt: { $gte: startOfYear } } },
+      { $group: { _id: null, revenue: { $sum: '$grandTotal' }, count: { $sum: 1 } } }
+    ]),
+    // By payment method (paid invoices only)
+    Invoice.aggregate([
+      { $match: { paymentStatus: 'Paid', paymentMethod: { $ne: '' } } },
+      { $group: { _id: '$paymentMethod', total: { $sum: '$grandTotal' }, count: { $sum: 1 } } },
+      { $sort: { total: -1 } }
+    ]),
+    // By payment status
+    Invoice.aggregate([
+      { $group: { _id: '$paymentStatus', total: { $sum: '$grandTotal' }, count: { $sum: 1 } } },
+      { $sort: { total: -1 } }
+    ]),
+    // Monthly trend — last 6 months
+    Invoice.aggregate([
+      { $match: { createdAt: { $gte: new Date(now.getFullYear(), now.getMonth() - 5, 1) } } },
+      { $group: {
+        _id: { year: { $year: '$createdAt' }, month: { $month: '$createdAt' } },
+        revenue: { $sum: '$grandTotal' },
+        paid: { $sum: { $cond: [{ $eq: ['$paymentStatus', 'Paid'] }, '$grandTotal', 0] } },
+        count: { $sum: 1 }
+      }},
+      { $sort: { '_id.year': 1, '_id.month': 1 } }
+    ]),
+    // Recent invoices with creator info
+    Invoice.find({}).populate(invoicePopulate).sort('-createdAt').limit(10)
+  ]);
+
+  // Growth vs last month
+  const thisMonthRevenue = thisMonth[0]?.revenue || 0;
+  const lastMonthRevenue = lastMonth[0]?.revenue || 0;
+  const growth = lastMonthRevenue === 0 ? null : Number((((thisMonthRevenue - lastMonthRevenue) / lastMonthRevenue) * 100).toFixed(1));
+
+  ok(res, {
+    overall: overall[0] || { totalRevenue: 0, totalPaid: 0, totalPending: 0, totalPartial: 0, totalDiscount: 0, totalTax: 0, count: 0, paidCount: 0, pendingCount: 0 },
+    thisMonth: { revenue: thisMonthRevenue, count: thisMonth[0]?.count || 0, paid: thisMonth[0]?.paid || 0 },
+    lastMonth: { revenue: lastMonthRevenue, count: lastMonth[0]?.count || 0 },
+    thisYear: { revenue: thisYear[0]?.revenue || 0, count: thisYear[0]?.count || 0 },
+    growth,
+    byPaymentMethod,
+    byStatus,
+    monthlyTrend,
+    recentInvoices: recentByCreator,
+  });
+}));
 app.get('/api/payments', protect, asyncRoute(async (req, res) => ok(res, await Payment.find(req.user.role === 'customer' ? { customer: req.user._id } : {}).populate('invoice booking').sort('-createdAt'))));
 app.post('/api/payments', protect, allow('admin', 'staff'), asyncRoute(async (req, res) => { const invoice = await Invoice.findById(req.body.invoice); if (!invoice) return res.status(404).json({ success: false, message: 'Invoice not found' }); const payment = await Payment.create({ ...req.body, booking: invoice.booking, customer: invoice.customer }); await Invoice.findByIdAndUpdate(invoice._id, { paymentStatus: req.body.status || 'Paid', paymentMethod: req.body.method }); ok(res, payment, 'Payment recorded'); }));
 app.get('/api/notifications', protect, asyncRoute(async (req, res) => ok(res, await Notification.find({ user: req.user._id }).sort('-createdAt').limit(30))));
