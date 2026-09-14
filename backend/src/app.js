@@ -4,6 +4,10 @@ import helmet from 'helmet';
 import morgan from 'morgan';
 import rateLimit from 'express-rate-limit';
 import jwt from 'jsonwebtoken';
+import multer from 'multer';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import fs from 'fs';
 import User from './models/User.js';
 import Vehicle from './models/Vehicle.js';
 import Service from './models/Service.js';
@@ -16,7 +20,41 @@ import Notification from './models/Notification.js';
 import { protect, allow } from './middleware/auth.js';
 import { notFound, errorHandler } from './middleware/error.js';
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const UPLOADS_DIR = path.join(__dirname, '..', 'uploads');
+// Ensure uploads sub-folders exist at startup
+['before', 'after'].forEach((sub) => {
+  const dir = path.join(UPLOADS_DIR, sub);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+});
+
+// Multer — store photos on disk under uploads/before|after/
+const photoStorage = multer.diskStorage({
+  destination(req, file, cb) {
+    const phase = req.params.phase === 'after' ? 'after' : 'before';
+    cb(null, path.join(UPLOADS_DIR, phase));
+  },
+  filename(req, file, cb) {
+    const ext = path.extname(file.originalname).toLowerCase() || '.jpg';
+    cb(null, `${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`);
+  },
+});
+const photoFilter = (req, file, cb) => {
+  if (/^image\/(jpeg|png|webp|gif)$/.test(file.mimetype)) cb(null, true);
+  else cb(new Error('Only JPEG, PNG, WEBP and GIF images are allowed'), false);
+};
+const uploadPhoto = multer({ storage: photoStorage, fileFilter: photoFilter, limits: { fileSize: 8 * 1024 * 1024, files: 10 } });
+
 const app = express();
+
+// ── Static uploads BEFORE helmet so we can set the correct CORP header ──────
+// helmet sets Cross-Origin-Resource-Policy: same-origin by default which blocks
+// the browser from loading images from a different port (e.g. :5000 vs :5174).
+app.use('/uploads', (req, res, next) => {
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  next();
+}, express.static(UPLOADS_DIR));
+
 app.use(helmet());
 const allowedOrigins = (process.env.CLIENT_URL || 'http://localhost:5173').split(',').map((origin) => origin.trim());
 const isAllowedOrigin = (origin) => !origin || allowedOrigins.includes(origin) || /^https?:\/\/localhost:\d+$/.test(origin);
@@ -98,7 +136,21 @@ app.post('/api/bookings', protect, asyncRoute(async (req, res) => {
   const booking = await Booking.create({ ...req.body, customer: req.user._id, estimatedCost: activeService.price, statusHistory: [{ status: 'Pending', changedBy: req.user._id }] });
   ok(res, await booking.populate(['vehicle', 'service']), 'Booking created');
 }));
-app.patch('/api/bookings/:id/status', protect, allow('admin', 'staff', 'mechanic'), asyncRoute(async (req, res) => { const booking = await Booking.findById(req.params.id); if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' }); if (req.user.role === 'mechanic' && String(booking.assignedMechanic) !== String(req.user._id)) return res.status(403).json({ success: false, message: 'This job is not assigned to you' }); booking.status = req.body.status; booking.statusHistory.push({ status: req.body.status, changedBy: req.user._id, note: req.body.note }); await booking.save(); await Notification.create({ user: booking.customer, title: 'Booking updated', message: `Your booking is now ${booking.status}.`, type: 'booking' }); ok(res, booking, 'Booking status updated'); }));
+app.patch('/api/bookings/:id/status', protect, allow('admin', 'staff', 'mechanic'), asyncRoute(async (req, res) => {
+  const booking = await Booking.findById(req.params.id);
+  if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' });
+  if (req.user.role === 'mechanic' && String(booking.assignedMechanic) !== String(req.user._id))
+    return res.status(403).json({ success: false, message: 'This job is not assigned to you' });
+  booking.status = req.body.status;
+  booking.statusHistory.push({ status: req.body.status, changedBy: req.user._id, note: req.body.note });
+  await booking.save();
+  // Auto-create invoice when booking is marked Completed
+  if (req.body.status === 'Completed') {
+    await autoCreateInvoice(booking, req.user._id);
+  }
+  await Notification.create({ user: booking.customer, title: 'Booking updated', message: `Your booking is now ${booking.status}.`, type: 'booking' });
+  ok(res, booking, 'Booking status updated');
+}));
 app.patch('/api/bookings/:id/assign-mechanic', protect, allow('admin', 'staff'), asyncRoute(async (req, res) => { const booking = await Booking.findByIdAndUpdate(req.params.id, { assignedMechanic: req.body.mechanicId, status: 'Assigned', $push: { statusHistory: { status: 'Assigned', changedBy: req.user._id } } }, { new: true }).populate('assignedMechanic', 'name'); if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' }); ok(res, booking, 'Mechanic assigned'); }));
 app.patch('/api/bookings/:id/assign-staff', protect, allow('admin'), asyncRoute(async (req, res) => { const existing = await Booking.findById(req.params.id); if (!existing) return res.status(404).json({ success: false, message: 'Booking not found' }); existing.assignedStaff = req.body.staffId; existing.statusHistory.push({ status: existing.status, changedBy: req.user._id, note: 'Staff advisor assigned' }); await existing.save(); ok(res, await existing.populate('assignedStaff', 'name'), 'Staff advisor assigned'); }));
 
@@ -170,69 +222,175 @@ app.get('/api/parts', protect, allow('admin', 'staff', 'mechanic'), asyncRoute(a
 app.post('/api/parts', protect, allow('admin', 'staff'), asyncRoute(async (req, res) => ok(res, await Part.create(req.body), 'Part added')));
 app.put('/api/parts/:id', protect, allow('admin', 'staff'), asyncRoute(async (req, res) => ok(res, await Part.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true }), 'Part updated')));
 app.patch('/api/parts/:id/stock', protect, allow('admin', 'staff', 'mechanic'), asyncRoute(async (req, res) => { const amount = Number(req.body.amount); if (!Number.isFinite(amount) || amount === 0) return res.status(422).json({ success: false, message: 'Stock amount must be a non-zero number' }); const part = await Part.findOneAndUpdate({ _id: req.params.id, ...(amount < 0 ? { quantity: { $gte: Math.abs(amount) } } : {}) }, { $inc: { quantity: amount } }, { new: true }); if (!part) return res.status(409).json({ success: false, message: 'Insufficient stock or part not found' }); ok(res, part, 'Stock updated'); }));
-app.get('/api/service-records', protect, asyncRoute(async (req, res) => ok(res, await ServiceRecord.find(req.user.role === 'customer' ? { customer: req.user._id } : req.user.role === 'mechanic' ? { mechanic: req.user._id } : {}).populate('vehicle booking mechanic').sort('-completedAt'))));
-app.post('/api/service-records', protect, allow('admin', 'staff', 'mechanic'), asyncRoute(async (req, res) => { const record = await ServiceRecord.create({ ...req.body, mechanic: req.user.role === 'mechanic' ? req.user._id : req.body.mechanic }); await Booking.findByIdAndUpdate(req.body.booking, { status: 'Completed' }); ok(res, record, 'Service record created'); }));
+// ── Shared helper: auto-create invoice from a completed booking ───────────────
+async function autoCreateInvoice(booking, triggeredBy) {
+  // Don't double-create
+  if (await Invoice.findOne({ booking: booking._id })) return null;
+  // Need a fully populated booking
+  const fullBooking = await Booking.findById(booking._id).populate('customer vehicle service');
+  if (!fullBooking?.customer || !fullBooking?.vehicle) return null;
+  const seededItems = fullBooking.service
+    ? [{ type: 'service', name: fullBooking.service.name, quantity: 1, price: fullBooking.service.price }]
+    : [];
+  if (!seededItems.length) return null;
+  const totals = invoiceTotals(seededItems, 0, 0);
+  const invoice = await Invoice.create({
+    invoiceNumber: await nextInvoiceNumber(),
+    booking: fullBooking._id,
+    customer: fullBooking.customer._id,
+    vehicle: fullBooking.vehicle._id,
+    ...totals,
+    notes: '',
+    paymentStatus: 'Pending',
+    paymentMethod: '',
+    createdBy: triggeredBy,
+  });
+  await Notification.create({
+    user: fullBooking.customer._id,
+    title: 'Invoice ready',
+    message: `Your service is complete. Invoice ${invoice.invoiceNumber} for ₹${totals.grandTotal.toLocaleString('en-IN')} is ready to view and download.`,
+    type: 'invoice',
+  });
+  return invoice;
+}
+const srPopulate = [
+  { path: 'vehicle' },
+  { path: 'customer', select: 'name email phone' },
+  { path: 'mechanic', select: 'name email phone specialization' },
+  { path: 'booking', populate: [{ path: 'service', select: 'name price category' }, { path: 'assignedMechanic', select: 'name specialization' }] },
+  { path: 'partsUsed.part', select: 'name partNumber' },
+];
+
+app.get('/api/service-records', protect, asyncRoute(async (req, res) => {
+  const filter =
+    req.user.role === 'customer' ? { customer: req.user._id } :
+    req.user.role === 'mechanic'  ? { mechanic: req.user._id }  : {};
+  ok(res, await ServiceRecord.find(filter).populate(srPopulate).sort('-createdAt'));
+}));
+
+// GET single service record by booking id (any authenticated user with access)
+app.get('/api/service-records/booking/:bookingId', protect, asyncRoute(async (req, res) => {
+  const record = await ServiceRecord.findOne({ booking: req.params.bookingId }).populate(srPopulate);
+  if (!record) return res.status(404).json({ success: false, message: 'No service record found for this booking' });
+  // Customers can only see their own records
+  if (req.user.role === 'customer' && String(record.customer?._id || record.customer) !== String(req.user._id))
+    return res.status(403).json({ success: false, message: 'Access denied' });
+  ok(res, record);
+}));
+
+app.post('/api/service-records', protect, allow('admin', 'staff', 'mechanic'), asyncRoute(async (req, res) => {
+  // Prevent duplicate records
+  const existing = await ServiceRecord.findOne({ booking: req.body.booking });
+  if (existing) return res.status(409).json({ success: false, message: 'A service record already exists for this booking' });
+  const booking = await Booking.findById(req.body.booking);
+  if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' });
+  const mechanicId = req.user.role === 'mechanic' ? req.user._id : (req.body.mechanic || booking.assignedMechanic);
+  const record = await ServiceRecord.create({
+    ...req.body,
+    mechanic: mechanicId,
+    customer: booking.customer,
+    vehicle: booking.vehicle,
+    serviceStartTime: req.body.serviceStartTime || new Date(),
+  });
+  await Booking.findByIdAndUpdate(req.body.booking, {
+    status: 'In Progress',
+    $push: { statusHistory: { status: 'In Progress', changedBy: req.user._id, note: 'Service record created' } },
+  });
+  ok(res, await ServiceRecord.findById(record._id).populate(srPopulate), 'Service record created');
+}));
+
+// PATCH — mechanic updates notes / work performed / mark complete
+app.patch('/api/service-records/:id', protect, allow('admin', 'staff', 'mechanic'), asyncRoute(async (req, res) => {
+  const record = await ServiceRecord.findById(req.params.id);
+  if (!record) return res.status(404).json({ success: false, message: 'Service record not found' });
+  if (req.user.role === 'mechanic' && String(record.mechanic) !== String(req.user._id))
+    return res.status(403).json({ success: false, message: 'This record is not assigned to you' });
+
+  const { workPerformed, mechanicNotes, recommendations, partsUsed, additionalServices, serviceEndTime, completedAt } = req.body;
+  if (workPerformed   !== undefined) record.workPerformed   = workPerformed;
+  if (mechanicNotes   !== undefined) record.mechanicNotes   = mechanicNotes;
+  if (recommendations !== undefined) record.recommendations = recommendations;
+  if (partsUsed       !== undefined) record.partsUsed       = partsUsed;
+  if (additionalServices !== undefined) record.additionalServices = additionalServices;
+  if (serviceEndTime  !== undefined) record.serviceEndTime  = serviceEndTime;
+  if (completedAt     !== undefined) {
+    record.completedAt = completedAt;
+    // Auto-mark booking as Completed
+    const completedBooking = await Booking.findByIdAndUpdate(record.booking, {
+      status: 'Completed',
+      $push: { statusHistory: { status: 'Completed', changedBy: req.user._id, note: 'Work completed by mechanic' } },
+    });
+    // Auto-generate invoice so the customer sees it immediately
+    await autoCreateInvoice(completedBooking || { _id: record.booking }, req.user._id);
+    await Notification.create({
+      user: record.customer,
+      title: 'Service completed',
+      message: 'Your vehicle service has been completed. Check the before & after photos and your invoice in the app.',
+      type: 'booking',
+    });
+  }
+  await record.save();
+  ok(res, await ServiceRecord.findById(record._id).populate(srPopulate), 'Record updated');
+}));
+
+// POST — upload before or after photos  (phase = 'before' | 'after')
+app.post(
+  '/api/service-records/:id/photos/:phase',
+  protect,
+  allow('admin', 'staff', 'mechanic'),
+  uploadPhoto.array('photos', 10),
+  asyncRoute(async (req, res) => {
+    const { id, phase } = req.params;
+    if (!['before', 'after'].includes(phase))
+      return res.status(400).json({ success: false, message: 'Phase must be before or after' });
+
+    const record = await ServiceRecord.findById(id);
+    if (!record) return res.status(404).json({ success: false, message: 'Service record not found' });
+    if (req.user.role === 'mechanic' && String(record.mechanic) !== String(req.user._id))
+      return res.status(403).json({ success: false, message: 'This record is not assigned to you' });
+    if (!req.files?.length)
+      return res.status(422).json({ success: false, message: 'No photos received' });
+
+    const captions = Array.isArray(req.body.captions) ? req.body.captions : [req.body.captions || ''];
+    const newPhotos = req.files.map((file, i) => ({
+      url: `/uploads/${phase}/${file.filename}`,
+      caption: captions[i] || '',
+    }));
+
+    const field = phase === 'before' ? 'beforePhotos' : 'afterPhotos';
+    record[field].push(...newPhotos);
+    await record.save();
+    ok(res, await ServiceRecord.findById(record._id).populate(srPopulate), `${phase} photos uploaded`);
+  }),
+);
+
+// DELETE a single photo
+app.delete('/api/service-records/:id/photos/:phase/:index', protect, allow('admin', 'staff', 'mechanic'), asyncRoute(async (req, res) => {
+  const { id, phase, index } = req.params;
+  if (!['before', 'after'].includes(phase)) return res.status(400).json({ success: false, message: 'Phase must be before or after' });
+  const record = await ServiceRecord.findById(id);
+  if (!record) return res.status(404).json({ success: false, message: 'Service record not found' });
+  if (req.user.role === 'mechanic' && String(record.mechanic) !== String(req.user._id))
+    return res.status(403).json({ success: false, message: 'This record is not assigned to you' });
+  const field = phase === 'before' ? 'beforePhotos' : 'afterPhotos';
+  const idx = Number(index);
+  if (idx < 0 || idx >= record[field].length) return res.status(404).json({ success: false, message: 'Photo not found' });
+  // Delete file from disk
+  const filePath = path.join(UPLOADS_DIR, record[field][idx].url.replace('/uploads/', '').replace(/\//g, path.sep));
+  fs.unlink(filePath, () => {}); // non-blocking, ignore errors if already gone
+  record[field].splice(idx, 1);
+  await record.save();
+  ok(res, await ServiceRecord.findById(record._id).populate(srPopulate), 'Photo deleted');
+}));
 app.get('/api/invoices', protect, asyncRoute(async (req, res) => {
-  if (!['customer', 'admin', 'staff'].includes(req.user.role)) return res.status(403).json({ success: false, message: 'You do not have access to invoices' });
+  if (!['customer', 'admin', 'staff'].includes(req.user.role))
+    return res.status(403).json({ success: false, message: 'You do not have access to invoices' });
   const filter = req.user.role === 'customer' ? { customer: req.user._id } : {};
   ok(res, await Invoice.find(filter).populate(invoicePopulate).sort('-createdAt'));
 }));
-app.get('/api/invoices/:id', protect, asyncRoute(async (req, res) => {
-  const invoice = await Invoice.findById(req.params.id).populate(invoicePopulate);
-  if (!invoice || !canViewInvoice(req.user, invoice)) return res.status(404).json({ success: false, message: 'Invoice not found' });
-  ok(res, invoice);
-}));
-app.post('/api/invoices', protect, allow('admin', 'staff'), asyncRoute(async (req, res) => {
-  const booking = await Booking.findById(req.body.booking).populate('customer vehicle service');
-  if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' });
-  if (['Cancelled', 'Rejected'].includes(booking.status)) return res.status(422).json({ success: false, message: 'Cannot invoice a cancelled or rejected booking' });
-  if (await Invoice.findOne({ booking: booking._id })) return res.status(409).json({ success: false, message: 'An invoice already exists for this booking' });
-  const seededItems = req.body.items?.length ? req.body.items : booking.service ? [{ type: 'service', name: booking.service.name, quantity: 1, price: booking.service.price }] : [];
-  const totals = invoiceTotals(seededItems, req.body.discount, req.body.tax);
-  if (!totals.items.length) return res.status(422).json({ success: false, message: 'Add at least one service or line item' });
-  const invoice = await Invoice.create({
-    invoiceNumber: await nextInvoiceNumber(),
-    booking: booking._id,
-    customer: booking.customer._id,
-    vehicle: booking.vehicle._id,
-    ...totals,
-    notes: req.body.notes || '',
-    paymentStatus: req.body.paymentStatus || 'Pending',
-    paymentMethod: req.body.paymentMethod || '',
-    createdBy: req.user._id,
-  });
-  await Notification.create({ user: booking.customer._id, title: 'Invoice ready', message: `Invoice ${invoice.invoiceNumber} for ₹${totals.grandTotal.toLocaleString('en-IN')} is ready to view and download.`, type: 'invoice' });
-  ok(res, await Invoice.findById(invoice._id).populate(invoicePopulate), 'Invoice generated');
-}));
-app.put('/api/invoices/:id', protect, allow('admin', 'staff'), asyncRoute(async (req, res) => {
-  const invoice = await Invoice.findById(req.params.id);
-  if (!invoice) return res.status(404).json({ success: false, message: 'Invoice not found' });
-  const totals = invoiceTotals(req.body.items, req.body.discount, req.body.tax);
-  if (!totals.items.length) return res.status(422).json({ success: false, message: 'Add at least one service or line item' });
-  invoice.set({
-    ...totals,
-    notes: req.body.notes ?? invoice.notes,
-    paymentStatus: req.body.paymentStatus || invoice.paymentStatus,
-    paymentMethod: req.body.paymentMethod ?? invoice.paymentMethod,
-  });
-  await invoice.save();
-  ok(res, await Invoice.findById(invoice._id).populate(invoicePopulate), 'Invoice updated');
-}));
-app.delete('/api/invoices/:id', protect, allow('admin', 'staff'), asyncRoute(async (req, res) => {
-  const invoice = await Invoice.findById(req.params.id);
-  if (!invoice) return res.status(404).json({ success: false, message: 'Invoice not found' });
-  if (invoice.paymentStatus === 'Paid' && req.user.role !== 'admin') return res.status(422).json({ success: false, message: 'Paid invoices can only be removed by an admin' });
-  await Payment.deleteMany({ invoice: invoice._id });
-  await invoice.deleteOne();
-  ok(res, null, 'Invoice deleted');
-}));
-app.patch('/api/invoices/:id/payment', protect, allow('admin', 'staff'), asyncRoute(async (req, res) => {
-  const invoice = await Invoice.findByIdAndUpdate(req.params.id, { paymentStatus: req.body.paymentStatus, paymentMethod: req.body.paymentMethod }, { new: true }).populate(invoicePopulate);
-  if (!invoice) return res.status(404).json({ success: false, message: 'Invoice not found' });
-  ok(res, invoice, 'Payment updated');
-}));
 
-// Admin invoice analytics — overall profit breakdown, monthly trend, top services
+// ── MUST be before /api/invoices/:id so Express doesn't treat 'analytics' as an id ──
+// Admin invoice analytics
 app.get('/api/invoices/analytics/summary', protect, allow('admin'), asyncRoute(async (req, res) => {
   const now = new Date();
   const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -314,7 +472,125 @@ app.get('/api/invoices/analytics/summary', protect, allow('admin'), asyncRoute(a
     recentInvoices: recentByCreator,
   });
 }));
-app.get('/api/payments', protect, asyncRoute(async (req, res) => ok(res, await Payment.find(req.user.role === 'customer' ? { customer: req.user._id } : {}).populate('invoice booking').sort('-createdAt'))));
+
+// ── These must come AFTER /analytics/summary to avoid param shadowing ──────
+app.get('/api/invoices/:id', protect, asyncRoute(async (req, res) => {
+  const invoice = await Invoice.findById(req.params.id).populate(invoicePopulate);
+  if (!invoice || !canViewInvoice(req.user, invoice))
+    return res.status(404).json({ success: false, message: 'Invoice not found' });
+  ok(res, invoice);
+}));
+
+app.post('/api/invoices', protect, allow('admin', 'staff'), asyncRoute(async (req, res) => {
+  const booking = await Booking.findById(req.body.booking).populate('customer vehicle service');
+  if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' });
+  if (['Cancelled', 'Rejected'].includes(booking.status))
+    return res.status(422).json({ success: false, message: 'Cannot invoice a cancelled or rejected booking' });
+  if (await Invoice.findOne({ booking: booking._id }))
+    return res.status(409).json({ success: false, message: 'An invoice already exists for this booking' });
+  const seededItems = req.body.items?.length
+    ? req.body.items
+    : booking.service ? [{ type: 'service', name: booking.service.name, quantity: 1, price: booking.service.price }] : [];
+  const totals = invoiceTotals(seededItems, req.body.discount, req.body.tax);
+  if (!totals.items.length)
+    return res.status(422).json({ success: false, message: 'Add at least one service or line item' });
+  const invoice = await Invoice.create({
+    invoiceNumber: await nextInvoiceNumber(),
+    booking: booking._id,
+    customer: booking.customer._id,
+    vehicle: booking.vehicle._id,
+    ...totals,
+    notes: req.body.notes || '',
+    paymentStatus: req.body.paymentStatus || 'Pending',
+    paymentMethod: req.body.paymentMethod || '',
+    createdBy: req.user._id,
+  });
+  await Notification.create({
+    user: booking.customer._id,
+    title: 'Invoice ready',
+    message: `Invoice ${invoice.invoiceNumber} for ₹${totals.grandTotal.toLocaleString('en-IN')} is ready to view and download.`,
+    type: 'invoice',
+  });
+  ok(res, await Invoice.findById(invoice._id).populate(invoicePopulate), 'Invoice generated');
+}));
+
+app.put('/api/invoices/:id', protect, allow('admin', 'staff'), asyncRoute(async (req, res) => {
+  const invoice = await Invoice.findById(req.params.id);
+  if (!invoice) return res.status(404).json({ success: false, message: 'Invoice not found' });
+  const totals = invoiceTotals(req.body.items, req.body.discount, req.body.tax);
+  if (!totals.items.length)
+    return res.status(422).json({ success: false, message: 'Add at least one service or line item' });
+  invoice.set({
+    ...totals,
+    notes: req.body.notes ?? invoice.notes,
+    paymentStatus: req.body.paymentStatus || invoice.paymentStatus,
+    paymentMethod: req.body.paymentMethod ?? invoice.paymentMethod,
+  });
+  await invoice.save();
+  ok(res, await Invoice.findById(invoice._id).populate(invoicePopulate), 'Invoice updated');
+}));
+
+app.delete('/api/invoices/:id', protect, allow('admin', 'staff'), asyncRoute(async (req, res) => {
+  const invoice = await Invoice.findById(req.params.id);
+  if (!invoice) return res.status(404).json({ success: false, message: 'Invoice not found' });
+  if (invoice.paymentStatus === 'Paid' && req.user.role !== 'admin')
+    return res.status(422).json({ success: false, message: 'Paid invoices can only be removed by an admin' });
+  await Payment.deleteMany({ invoice: invoice._id });
+  await invoice.deleteOne();
+  ok(res, null, 'Invoice deleted');
+}));
+
+app.patch('/api/invoices/:id/payment', protect, allow('admin', 'staff'), asyncRoute(async (req, res) => {
+  const invoice = await Invoice.findById(req.params.id);
+  if (!invoice) return res.status(404).json({ success: false, message: 'Invoice not found' });
+  if (req.body.paymentStatus !== undefined) invoice.paymentStatus = req.body.paymentStatus;
+  if (req.body.paymentMethod !== undefined) invoice.paymentMethod = req.body.paymentMethod;
+  await invoice.save();
+  if (invoice.paymentStatus === 'Paid') {
+    await Notification.create({
+      user: invoice.customer,
+      title: 'Payment received',
+      message: `Payment for invoice ${invoice.invoiceNumber} (₹${invoice.grandTotal.toLocaleString('en-IN')}) has been confirmed. Thank you!`,
+      type: 'invoice',
+    });
+  }
+  ok(res, await Invoice.findById(invoice._id).populate(invoicePopulate), 'Payment updated');
+}));
+
+// Customer self-payment: customer confirms they have paid at the workshop
+app.patch('/api/invoices/:id/customer-payment', protect, asyncRoute(async (req, res) => {
+  const invoice = await Invoice.findById(req.params.id).populate('customer');
+  if (!invoice) return res.status(404).json({ success: false, message: 'Invoice not found' });
+  // Customers can only pay their own invoices
+  if (req.user.role === 'customer' && String(invoice.customer?._id || invoice.customer) !== String(req.user._id))
+    return res.status(403).json({ success: false, message: 'You can only pay your own invoices' });
+  if (invoice.paymentStatus === 'Paid')
+    return res.status(422).json({ success: false, message: 'This invoice is already marked as paid' });
+  invoice.paymentStatus = 'Paid';
+  invoice.paymentMethod = req.body.paymentMethod || 'Cash';
+  await invoice.save();
+  // Notify admin/staff that customer confirmed payment
+  const staffList = await User.find({ role: { $in: ['admin', 'staff'] }, isActive: true }).select('_id');
+  await Promise.all(staffList.map((s) =>
+    Notification.create({
+      user: s._id,
+      title: 'Payment received',
+      message: `Customer ${req.user.name} paid invoice ${invoice.invoiceNumber} (₹${invoice.grandTotal.toLocaleString('en-IN')}) via ${invoice.paymentMethod}.`,
+      type: 'invoice',
+    })
+  ));
+  ok(res, await Invoice.findById(invoice._id).populate(invoicePopulate), 'Payment confirmed. Thank you!');
+}));
+// Staff/admin can call this to fix any historical gaps
+app.post('/api/invoices/backfill', protect, allow('admin', 'staff'), asyncRoute(async (req, res) => {
+  const completedBookings = await Booking.find({ status: 'Completed' });
+  let created = 0;
+  for (const booking of completedBookings) {
+    const inv = await autoCreateInvoice(booking, req.user._id);
+    if (inv) created++;
+  }
+  ok(res, { created }, `Backfilled ${created} invoice(s)`);
+}));
 app.post('/api/payments', protect, allow('admin', 'staff'), asyncRoute(async (req, res) => { const invoice = await Invoice.findById(req.body.invoice); if (!invoice) return res.status(404).json({ success: false, message: 'Invoice not found' }); const payment = await Payment.create({ ...req.body, booking: invoice.booking, customer: invoice.customer }); await Invoice.findByIdAndUpdate(invoice._id, { paymentStatus: req.body.status || 'Paid', paymentMethod: req.body.method }); ok(res, payment, 'Payment recorded'); }));
 app.get('/api/notifications', protect, asyncRoute(async (req, res) => ok(res, await Notification.find({ user: req.user._id }).sort('-createdAt').limit(30))));
 app.patch('/api/notifications/read-all', protect, asyncRoute(async (req, res) => { await Notification.updateMany({ user: req.user._id }, { isRead: true }); ok(res, null, 'Notifications marked as read'); }));
