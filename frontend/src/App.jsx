@@ -5,6 +5,7 @@ import AuthPage from './pages/auth/AuthPage';
 import DashboardPage from './pages/dashboard/DashboardPage';
 import VehiclesPage from './pages/customer/VehiclesPage';
 import BookServicePage from './pages/customer/BookServicePage';
+import MyBookingsPage from './pages/customer/MyBookingsPage';
 import RecordsPage from './pages/records/RecordsPage';
 import NotificationsPage from './pages/notifications/NotificationsPage';
 import OperationsPage from './pages/operations/OperationsPage';
@@ -28,7 +29,7 @@ export default function App() {
     <Route path="/" element={<DashboardPage user={user} />} />
     <Route path="/vehicles" element={<VehiclesPage />} />
     <Route path="/book" element={<BookServicePage />} />
-    <Route path="/bookings" element={<RecordsPage type="bookings" />} />
+    <Route path="/bookings" element={<MyBookingsPage />} />
     <Route path="/history" element={<RecordsPage type="history" />} />
     <Route path="/invoices" element={<RecordsPage type="invoices" />} />
     <Route path="/team" element={<OperationsPage type="team" />} />
@@ -38,7 +39,7 @@ export default function App() {
     <Route path="/customer/dashboard" element={<DashboardPage user={user} />} />
     <Route path="/customer/vehicles" element={<VehiclesPage />} />
     <Route path="/customer/book-service" element={<BookServicePage />} />
-    <Route path="/customer/bookings" element={<RecordsPage type="bookings" />} />
+    <Route path="/customer/bookings" element={<MyBookingsPage />} />
     <Route path="/customer/service-history" element={<RecordsPage type="history" />} />
     <Route path="/customer/invoices" element={<RecordsPage type="invoices" />} />
     <Route path="/admin/dashboard" element={<DashboardPage user={user} />} />
